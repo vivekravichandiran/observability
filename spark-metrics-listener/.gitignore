@@ -1,0 +1,23 @@
+# SBT
+target/
+project/target/
+project/project/
+
+# IDE
+.idea/
+*.iml
+.bsp/
+.metals/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Compiled
+*.class
+*.jar
+!lib/*.jar
