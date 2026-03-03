@@ -123,6 +123,17 @@ ALTER TABLE myn_monitor_demo.observability.spark_stage_metrics
 SET TBLPROPERTIES ('delta.dataSkippingNumIndexedCols' = '4');
 
 -- ============================================================================
+-- Create Volume for metrics files (optional, for Unity Catalog managed storage)
+-- ============================================================================
+-- CREATE VOLUME IF NOT EXISTS myn_monitor_demo.observability.spark_metrics;
+
+-- ============================================================================
+-- Create directory for metrics files via DBFS
+-- ============================================================================
+-- Run this in a Python cell:
+-- dbutils.fs.mkdirs("/myn_monitor_demo/observability/spark_metrics")
+
+-- ============================================================================
 -- Verification Queries
 -- ============================================================================
 -- Run these queries to verify the tables were created successfully:
