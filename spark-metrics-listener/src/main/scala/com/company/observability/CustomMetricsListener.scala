@@ -135,8 +135,7 @@ class CustomMetricsListener extends SparkListener with Serializable {
       
       val status = jobEnd.jobResult match {
         case JobSucceeded => "SUCCEEDED"
-        case JobFailed(exception) => s"FAILED: ${exception.getMessage.take(200)}"
-        case _ => "UNKNOWN"
+        case _ => "FAILED"
       }
 
       writeJobMetrics(

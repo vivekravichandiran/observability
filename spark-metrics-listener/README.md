@@ -361,3 +361,85 @@ private val SCHEMA = "observability"
 ## License
 
 Copyright © 2024 Company. All rights reserved.
+
+
+## Errors:
+
+[info] compiling 1 Scala source to /Users/vivek.ravichandiran/Documents/observability/spark-metrics-listener/target/scala-2.12/classes ...
+[info] Non-compiled module 'compiler-bridge_2.12' for Scala 2.12.17. Compiling...
+error:
+  bad constant pool index: 0 at pos: 49428compileIncremental 0s
+     while compiling: <no file>
+        during phase: globalPhase=<no phase>, enteringPhase=<some phase>
+     library version: version 2.12.17
+    compiler version: version 2.12.17
+  reconstructed args: -bootclasspath /Users/vivek.ravichandiran/Library/Caches/Coursier/v1/https/repo1.maven.org/maven2/org/scala-lang/scala-library/2.12.17/scala-library-2.12.17.jar -nowarn -classpath /Users/vivek.ravichandiran/Library/Caches/Coursier/v1/https/repo1.maven.org/ma
+
+
+✅ Step 1 — Install Java 11 (if not installed)
+
+Run:
+
+brew install openjdk@11
+
+After install, Homebrew usually tells you to add it to PATH.
+
+✅ Step 2 — Verify Java 11 Is Installed
+
+Run:
+
+/usr/libexec/java_home -V
+
+You should see something like:
+
+11.0.x (arm64) "OpenJDK 11"
+25.0.2 (arm64) "OpenJDK 25"
+✅ Step 3 — Temporarily Switch to Java 11 (Current Terminal Only)
+
+Run:
+
+export JAVA_HOME=$(/usr/libexec/java_home -v 11)
+export PATH=$JAVA_HOME/bin:$PATH
+
+Now check:
+
+java -version
+
+It should show:
+
+openjdk version "11.x.x"
+
+If it does — good.
+
+Now try:
+
+sbt clean compile
+
+It should work.
+
+✅ Step 4 — Make Java 11 Default (Permanent Fix)
+
+You need to update your shell profile.
+
+If using zsh (default on macOS):
+
+Open:
+
+nano ~/.zshrc
+
+Add this at the bottom:
+
+export JAVA_HOME=$(/usr/libexec/java_home -v 11)
+export PATH=$JAVA_HOME/bin:$PATH
+
+Save and exit.
+
+Then reload:
+
+source ~/.zshrc
+
+Verify again:
+
+java -version
+
+It must show Java 11.
