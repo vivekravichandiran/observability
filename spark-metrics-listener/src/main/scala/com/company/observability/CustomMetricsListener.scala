@@ -1,12 +1,11 @@
 package com.company.observability
 
-import org.apache.spark.SparkConf
 import org.apache.spark.scheduler._
-import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.sql.types._
+import org.apache.spark.sql.SparkSession
 
 import java.sql.Timestamp
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent._
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.JavaConverters._
 import scala.util.Try
 
@@ -15,6 +14,9 @@ import scala.util.Try
  * 
  * Captures Spark application, job, and stage metrics and writes them to
  * Unity Catalog Delta tables for observability and monitoring.
+ * 
+ * IMPORTANT: All writes are performed asynchronously to prevent blocking
+ * the Spark event processing thread and avoid recursive event handling.
  * 
  * Target tables:
  *   - myn_monitor_demo.observability.spark_application_metrics
@@ -48,6 +50,60 @@ class CustomMetricsListener extends SparkListener with Serializable {
   // Job to stage mapping for stage metrics
   private val stageToJobMapping = new ConcurrentHashMap[Int, Int]()
 
+  // ============================================================================
+  // ASYNC EXECUTION - Prevents blocking event thread and recursive issues
+  // ============================================================================
+  
+  // Single-threaded executor to serialize writes and prevent overwhelming Delta
+  @transient private lazy val writeExecutor: ExecutorService = {
+    val tf = new ThreadFactory {
+      override def newThread(r: Runnable): Thread = {
+        val t = new Thread(r, "CustomMetricsListener-Writer")
+        t.setDaemon(true)
+        t
+      }
+    }
+    Executors.newSingleThreadExecutor(tf)
+  }
+  
+  // Flag to prevent recursive event handling during our own writes
+  @transient private val isWriting: ThreadLocal[Boolean] = ThreadLocal.withInitial(() => false)
+  
+  // Track if we should skip events (during shutdown or our own writes)
+  private val isShuttingDown = new AtomicBoolean(false)
+
+  /**
+   * Check if we should process this event
+   * Returns false if we're currently writing (to prevent recursion)
+   */
+  private def shouldProcessEvent: Boolean = {
+    !isWriting.get() && !isShuttingDown.get()
+  }
+
+  /**
+   * Submit a write task asynchronously
+   * This prevents blocking the Spark event processing thread
+   */
+  private def submitWriteTask(task: => Unit): Unit = {
+    try {
+      writeExecutor.submit(new Runnable {
+        override def run(): Unit = {
+          isWriting.set(true)
+          try {
+            task
+          } catch {
+            case e: Exception => logError("Async write task failed", e)
+          } finally {
+            isWriting.set(false)
+          }
+        }
+      })
+    } catch {
+      case e: RejectedExecutionException =>
+        logError("Write task rejected - executor shutting down", e)
+    }
+  }
+
   /**
    * Lazily get SparkSession - DO NOT create in constructor
    * This ensures we don't interfere with Spark initialization
@@ -61,6 +117,7 @@ class CustomMetricsListener extends SparkListener with Serializable {
   // ============================================================================
 
   override def onApplicationStart(applicationStart: SparkListenerApplicationStart): Unit = {
+    if (!shouldProcessEvent) return
     try {
       appId = applicationStart.appId.getOrElse("unknown")
       appName = applicationStart.appName
@@ -73,13 +130,17 @@ class CustomMetricsListener extends SparkListener with Serializable {
 
   override def onApplicationEnd(applicationEnd: SparkListenerApplicationEnd): Unit = {
     try {
+      isShuttingDown.set(true)
+      
       val endTime = applicationEnd.time
       val durationMs = if (appStartTime > 0) endTime - appStartTime else 0L
 
       // Aggregate all stage metrics
       val aggregated = aggregateStageMetrics()
-
-      writeApplicationMetrics(
+      
+      // For application end, we write synchronously to ensure data is captured
+      // before the application terminates, but we still protect against recursion
+      writeApplicationMetricsSync(
         sparkAppId = appId,
         appName = appName,
         startTime = new Timestamp(appStartTime),
@@ -95,12 +156,26 @@ class CustomMetricsListener extends SparkListener with Serializable {
         totalShuffleWriteBytes = aggregated.shuffleWriteBytes,
         totalMemorySpilled = aggregated.memoryBytesSpilled,
         totalDiskSpilled = aggregated.diskBytesSpilled,
-        successFlag = true // Will be overridden if we track failures
+        successFlag = true
       )
+      
+      // Shutdown executor gracefully
+      shutdownExecutor()
 
       logInfo(s"Application ended: $appName ($appId), duration: ${durationMs}ms")
     } catch {
       case e: Exception => logError("Error in onApplicationEnd", e)
+    }
+  }
+  
+  private def shutdownExecutor(): Unit = {
+    try {
+      writeExecutor.shutdown()
+      if (!writeExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+        writeExecutor.shutdownNow()
+      }
+    } catch {
+      case e: Exception => logError("Error shutting down executor", e)
     }
   }
 
@@ -109,6 +184,7 @@ class CustomMetricsListener extends SparkListener with Serializable {
   // ============================================================================
 
   override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+    if (!shouldProcessEvent) return
     try {
       val jobId = jobStart.jobId
       jobStartTimes.put(jobId, jobStart.time)
@@ -125,6 +201,7 @@ class CustomMetricsListener extends SparkListener with Serializable {
   }
 
   override def onJobEnd(jobEnd: SparkListenerJobEnd): Unit = {
+    if (!shouldProcessEvent) return
     try {
       val jobId = jobEnd.jobId
       val endTime = jobEnd.time
@@ -138,15 +215,22 @@ class CustomMetricsListener extends SparkListener with Serializable {
         case _ => "FAILED"
       }
 
-      writeJobMetrics(
-        sparkAppId = appId,
-        sparkJobId = jobId.toLong,
-        startTime = new Timestamp(startTime),
-        endTime = new Timestamp(endTime),
-        durationMs = durationMs,
-        numStages = numStages,
-        status = status
-      )
+      // Capture values for async closure
+      val capturedAppId = appId
+      val capturedStartTime = new Timestamp(startTime)
+      val capturedEndTime = new Timestamp(endTime)
+      
+      submitWriteTask {
+        writeJobMetrics(
+          sparkAppId = capturedAppId,
+          sparkJobId = jobId.toLong,
+          startTime = capturedStartTime,
+          endTime = capturedEndTime,
+          durationMs = durationMs,
+          numStages = numStages,
+          status = status
+        )
+      }
 
       // Cleanup
       jobStartTimes.remove(jobId)
@@ -162,6 +246,7 @@ class CustomMetricsListener extends SparkListener with Serializable {
   // ============================================================================
 
   override def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit = {
+    if (!shouldProcessEvent) return
     try {
       val stageInfo = stageCompleted.stageInfo
       val stageId = stageInfo.stageId
@@ -198,26 +283,33 @@ class CustomMetricsListener extends SparkListener with Serializable {
         diskBytesSpilled = diskBytesSpilled
       ))
 
-      writeStageMetrics(
-        sparkAppId = appId,
-        sparkJobId = jobId.toLong,
-        stageId = stageId,
-        stageAttempt = stageAttemptId,
-        stageName = Option(stageInfo.name).getOrElse("unknown"),
-        numTasks = stageInfo.numTasks,
-        executorRunTime = executorRunTime,
-        executorCpuTime = executorCpuTime,
-        inputBytes = inputBytes,
-        inputRecords = inputRecords,
-        outputBytes = outputBytes,
-        outputRecords = outputRecords,
-        shuffleReadBytes = shuffleReadBytes,
-        shuffleReadRecords = shuffleReadRecords,
-        shuffleWriteBytes = shuffleWriteBytes,
-        shuffleWriteRecords = shuffleWriteRecords,
-        memorySpilled = memoryBytesSpilled,
-        diskSpilled = diskBytesSpilled
-      )
+      // Capture values for async closure
+      val capturedAppId = appId
+      val capturedStageName = Option(stageInfo.name).getOrElse("unknown")
+      val capturedNumTasks = stageInfo.numTasks
+      
+      submitWriteTask {
+        writeStageMetrics(
+          sparkAppId = capturedAppId,
+          sparkJobId = jobId.toLong,
+          stageId = stageId,
+          stageAttempt = stageAttemptId,
+          stageName = capturedStageName,
+          numTasks = capturedNumTasks,
+          executorRunTime = executorRunTime,
+          executorCpuTime = executorCpuTime,
+          inputBytes = inputBytes,
+          inputRecords = inputRecords,
+          outputBytes = outputBytes,
+          outputRecords = outputRecords,
+          shuffleReadBytes = shuffleReadBytes,
+          shuffleReadRecords = shuffleReadRecords,
+          shuffleWriteBytes = shuffleWriteBytes,
+          shuffleWriteRecords = shuffleWriteRecords,
+          memorySpilled = memoryBytesSpilled,
+          diskSpilled = diskBytesSpilled
+        )
+      }
 
       logInfo(s"Stage $stageId (attempt $stageAttemptId) completed: ${stageInfo.name}")
     } catch {
@@ -226,10 +318,13 @@ class CustomMetricsListener extends SparkListener with Serializable {
   }
 
   // ============================================================================
-  // Write Methods
+  // Write Methods (called from async executor thread)
   // ============================================================================
 
-  private def writeApplicationMetrics(
+  /**
+   * Synchronous write for application metrics (used during shutdown)
+   */
+  private def writeApplicationMetricsSync(
     sparkAppId: String,
     appName: String,
     startTime: Timestamp,
@@ -247,6 +342,7 @@ class CustomMetricsListener extends SparkListener with Serializable {
     totalDiskSpilled: Long,
     successFlag: Boolean
   ): Unit = {
+    isWriting.set(true)
     try {
       getSparkSession.foreach { spark =>
         import spark.implicits._
@@ -298,6 +394,8 @@ class CustomMetricsListener extends SparkListener with Serializable {
       }
     } catch {
       case e: Exception => logError(s"Failed to write application metrics to $APP_METRICS_TABLE", e)
+    } finally {
+      isWriting.set(false)
     }
   }
 
@@ -444,7 +542,6 @@ class CustomMetricsListener extends SparkListener with Serializable {
   }
 
   private def logInfo(message: String): Unit = {
-    // Use println for simplicity - in production, consider using Spark's internal logging
     println(s"[CustomMetricsListener] INFO: $message")
   }
 
