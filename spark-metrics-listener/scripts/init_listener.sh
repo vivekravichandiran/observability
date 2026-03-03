@@ -13,7 +13,7 @@
 
 set -e
 
-JAR_SOURCE="dbfs:/databricks/jars/spark-metrics-listener-assembly-1.0.jar"
+JAR_SOURCE="/Volumes/myn_monitor_demo/observability/spark_metrics/spark-metrics-listener-assembly-1.0.jar"
 JAR_DEST="/databricks/jars/"
 
 echo "[init_listener] Starting CustomMetricsListener initialization..."
